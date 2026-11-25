@@ -2,8 +2,10 @@
 Resolve missing ResourceName values from Focus reports via OCI Resource Search.
 
 Reads unique resources from the last N days of FocusReports/ConsolidatedCSV.
-When ResourceName is empty and ResourceId is an OCID, runs FreeTextSearch with
-that ResourceId and uses display_name (or name) from the result.
+When ResourceName is empty and ResourceId is an OCID, looks the OCID up with
+Resource Search and uses display_name (or name) from the result. OCIDs are
+looked up in batches (one structured query for up to SEARCH_BATCH_SIZE OCIDs),
+regions are processed in parallel and each region runs a few batches at once.
 
 If the resource is not found, or lifecycle_state is TERMINATED/DELETED, the
 stored name gets " (deleted)" appended.
@@ -44,7 +46,8 @@ application_version = "16.07.2026"
 DEFAULT_DAY_WINDOW = 30
 OUTPUT_JSON_NAME = "oci-resource-names.json"
 MAX_REGION_WORKERS = 15
-MAX_SEARCH_WORKERS = 10
+MAX_SEARCH_WORKERS = 4      # concurrent search calls per region (API limits are per region)
+SEARCH_BATCH_SIZE = 40      # OCIDs per structured search query
 DELETED_MARKER = " (deleted)"
 _DELETED_LIFECYCLE_STATES = frozenset({"TERMINATED", "DELETED"})
 
@@ -173,45 +176,50 @@ def collect_unique_resources(
     return resources
 
 
-def search_resource_name(search_client, resource_id: str) -> tuple[str, bool]:
+def search_resource_names_batch(
+    region_config: dict, signer, resource_ids: list[str]
+) -> dict[str, tuple[str, bool]] | None:
     """
-    FreeTextSearch for resource_id.
+    Look up several OCIDs with one structured search query.
 
-    Returns (name, is_deleted):
-      - found active: (display_name, False)
-      - found terminated/deleted: (display_name, True)
-      - not found: ("", True)
-      - search/API error: ("", False)  # unknown; do not mark deleted
+    Returns {resource_id: (name, is_deleted)} for the OCIDs that were found
+    (OCIDs that are missing from the result do not exist anymore), or None when
+    the search call failed (result unknown). Uses its own client, so it can run
+    in a thread.
     """
-    details = oci.resource_search.models.FreeTextSearchDetails(
-        text=resource_id,
-        matching_context_type=oci.resource_search.models.FreeTextSearchDetails.MATCHING_CONTEXT_TYPE_NONE,
+    client = oci.resource_search.ResourceSearchClient(region_config, signer=signer)
+    query = "query all resources where " + " || ".join(
+        f"identifier = '{rid}'" for rid in resource_ids
     )
+    details = oci.resource_search.models.StructuredSearchDetails(query=query)
+    found: dict[str, tuple[str, bool]] = {}
+    page = None
     try:
-        response = search_client.search_resources(
-            details,
-            limit=10,
-            retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY,
-        )
+        while True:
+            response = client.search_resources(
+                details,
+                limit=1000,
+                page=page,
+                retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY,
+            )
+            for item in response.data.items or []:
+                identifier = (getattr(item, "identifier", None) or "").strip()
+                if identifier:
+                    name = name_from_search_item(item) or identifier
+                    found[identifier] = (name, is_deleted_lifecycle(item.lifecycle_state))
+            page = response.next_page
+            if not page:
+                break
     except oci.exceptions.ServiceError as e:
         if e.status == 401:
             raise
-        _region_print(f"  Search failed for {resource_id}: {e.status} {e.message}")
-        return "", False
+        _region_print(f"  [{region_config['region']}] Search failed for a batch of "
+                      f"{len(resource_ids)}: {e.status} {e.message}")
+        return None
     except oci.exceptions.RequestException as e:
-        _region_print(f"  Search connection error for {resource_id}: {e}")
-        return "", False
-
-    items = getattr(response, "data", None)
-    items = getattr(items, "items", None) or []
-    # Free-text can return unrelated hits; only accept exact OCID match.
-    for item in items:
-        identifier = (getattr(item, "identifier", None) or "").strip()
-        if identifier == resource_id:
-            name = name_from_search_item(item) or resource_id
-            state = getattr(item, "lifecycle_state", None)
-            return name, is_deleted_lifecycle(state)
-    return "", True
+        _region_print(f"  [{region_config['region']}] Search connection error for a batch: {e}")
+        return None
+    return found
 
 
 def resolve_names_for_region(
@@ -226,7 +234,6 @@ def resolve_names_for_region(
 
     region_config = dict(base_config)
     region_config["region"] = region
-    search_client = oci.resource_search.ResourceSearchClient(region_config, signer=signer)
 
     to_search: list[dict] = []
     resolved: list[dict] = []
@@ -248,40 +255,40 @@ def resolve_names_for_region(
     if not to_search:
         return resolved
 
+    batches = [
+        to_search[i:i + SEARCH_BATCH_SIZE] for i in range(0, len(to_search), SEARCH_BATCH_SIZE)
+    ]
     try:
-        with ThreadPoolExecutor(
-            max_workers=min(len(to_search), MAX_SEARCH_WORKERS)
-        ) as executor:
+        with ThreadPoolExecutor(max_workers=min(len(batches), MAX_SEARCH_WORKERS)) as executor:
             futures = {
-                executor.submit(search_resource_name, search_client, r["resourceId"]): r
-                for r in to_search
+                executor.submit(
+                    search_resource_names_batch,
+                    region_config,
+                    signer,
+                    [r["resourceId"] for r in batch],
+                ): batch
+                for batch in batches
             }
             for fut in as_completed(futures):
-                src = futures[fut]
-                entry = dict(src)
-                try:
-                    name, deleted = fut.result()
-                except oci.exceptions.ServiceError as e:
-                    if e.status == 401:
-                        raise
-                    _region_print(
-                        f"  Search failed for {src['resourceId']}: {e.status} {e.message}"
-                    )
-                    name, deleted = "", False
-                if name:
-                    display = with_deleted_marker(name) if deleted else name
-                    entry["resourceName"] = display
-                    entry["source"] = "oci_search"
-                    _region_print(f"  {src['resourceId']}: {display}")
-                elif deleted:
-                    display = with_deleted_marker(src["resourceId"])
-                    entry["resourceName"] = display
-                    entry["source"] = "unresolved"
-                    _region_print(f"  {src['resourceId']}: {display}")
-                else:
-                    entry["resourceName"] = src["resourceId"]
-                    entry["source"] = "unresolved"
-                resolved.append(entry)
+                batch = futures[fut]
+                found = fut.result()
+                for src in batch:
+                    entry = dict(src)
+                    if found is None:
+                        name, deleted = "", False          # search failed: unknown
+                    else:
+                        name, deleted = found.get(src["resourceId"], ("", True))
+                    if name:
+                        display = with_deleted_marker(name) if deleted else name
+                        entry["resourceName"] = display
+                        entry["source"] = "oci_search"
+                    elif deleted:
+                        entry["resourceName"] = with_deleted_marker(src["resourceId"])
+                        entry["source"] = "unresolved"
+                    else:
+                        entry["resourceName"] = src["resourceId"]
+                        entry["source"] = "unresolved"
+                    resolved.append(entry)
     except oci.exceptions.ServiceError as e:
         if e.status == 401:
             _region_print(
@@ -289,10 +296,10 @@ def resolve_names_for_region(
             )
             return [dict(r) for r in resources]
         raise
-    except oci.exceptions.RequestException as e:
-        _region_print(f"  Skipping region {region}: connection/DNS error. {e}")
-        return [dict(r) for r in resources]
 
+    found_count = sum(1 for r in resolved if r.get("source") == "oci_search")
+    _region_print(f"  [{region}] {found_count} of {len(to_search)} name(s) found "
+                  f"({len(batches)} search call(s))")
     return resolved
 
 
