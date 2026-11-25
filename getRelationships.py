@@ -52,6 +52,7 @@ BLOCK_VOLUME_RESOURCE_TYPE = "volume"
 BOOT_VOLUME_BACKUP_RESOURCE_TYPE = "bootvolumebackup"
 BLOCK_VOLUME_BACKUP_RESOURCE_TYPE = "volumebackup"
 MAX_REGION_WORKERS = 15
+MAX_INSTANCE_WORKERS = 6    # instances looked up at the same time per region (API limits are per region)
 _BACKUP_ACTIVE_STATES = frozenset(
     {"AVAILABLE", "CREATING", "REQUEST_RECEIVED", "COPYING", "RESTORING"}
 )
@@ -345,85 +346,94 @@ def related_resources_for_instance(
     return related
 
 
+def _relationship_for_instance(inst: dict, region_config: dict, signer, clients) -> dict | None:
+    """Look up one instance and its volumes/backups. Returns the relationship or None (skip)."""
+    if not hasattr(clients, "compute"):
+        # SDK clients are not shared between threads: one pair per worker thread.
+        clients.compute = oci.core.ComputeClient(region_config, signer=signer)
+        clients.block = oci.core.BlockstorageClient(region_config, signer=signer)
+    compute_client, block_client = clients.compute, clients.block
+
+    instance_id = inst["resourceId"]
+    compartment_id = (inst.get("compartmentId") or "").strip()
+    resource_name = (inst.get("resourceName") or "").strip()
+    availability_domain = ""
+
+    try:
+        api_inst = compute_client.get_instance(
+            instance_id, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY
+        ).data
+        display = (getattr(api_inst, "display_name", None) or "").strip()
+        if display:
+            resource_name = display
+        if not compartment_id:
+            compartment_id = (getattr(api_inst, "compartment_id", None) or "").strip()
+        availability_domain = (getattr(api_inst, "availability_domain", None) or "").strip()
+    except oci.exceptions.ServiceError as e:
+        if e.status == 401:
+            raise
+        if e.status == 404:
+            _region_print(f"  Instance not found (skip): {instance_id}")
+            return None
+        _region_print(f"  get_instance failed for {instance_id}: {e.status} {e.message}")
+        if not compartment_id:
+            return None
+
+    if not resource_name:
+        resource_name = instance_id
+    if not compartment_id:
+        _region_print(f"  No compartment for {instance_id}; skip attachments")
+        related: list[dict] = []
+    else:
+        related = related_resources_for_instance(
+            compute_client, block_client, instance_id, compartment_id, availability_domain
+        )
+
+    backup_n = sum(
+        1
+        for r in related
+        if r.get("resourceType")
+        in (BOOT_VOLUME_BACKUP_RESOURCE_TYPE, BLOCK_VOLUME_BACKUP_RESOURCE_TYPE)
+    )
+    _region_print(f"  {resource_name}: {len(related)} related ({backup_n} backup(s))")
+    return {
+        "master": {
+            "resourceName": resource_name,
+            "resourceType": INSTANCE_RESOURCE_TYPE,
+            "resourceId": instance_id,
+        },
+        "related": related,
+    }
+
+
 def build_relationships_for_region(
     region: str,
     base_config: dict,
     signer,
     instances: list[dict],
 ) -> list[dict]:
-    """Resolve OCI attachments and backups for all instances in one region."""
+    """Resolve OCI attachments and backups for all instances in one region.
+    Instances are processed in parallel (MAX_INSTANCE_WORKERS per region); results keep
+    the input order."""
     if not instances:
         return []
 
     region_config = dict(base_config)
     region_config["region"] = region
-    compute_client = oci.core.ComputeClient(region_config, signer=signer)
-    block_client = oci.core.BlockstorageClient(region_config, signer=signer)
+    clients = threading.local()
 
     _region_print(f"\n--- Region: {region} ({len(instances)} instance(s)) ---")
-    results: list[dict] = []
 
     try:
-        for inst in instances:
-            instance_id = inst["resourceId"]
-            compartment_id = (inst.get("compartmentId") or "").strip()
-            resource_name = (inst.get("resourceName") or "").strip()
-            availability_domain = ""
-
-            try:
-                api_inst = compute_client.get_instance(instance_id).data
-                display = (getattr(api_inst, "display_name", None) or "").strip()
-                if display:
-                    resource_name = display
-                if not compartment_id:
-                    compartment_id = (getattr(api_inst, "compartment_id", None) or "").strip()
-                availability_domain = (getattr(api_inst, "availability_domain", None) or "").strip()
-            except oci.exceptions.ServiceError as e:
-                if e.status == 401:
-                    raise
-                if e.status == 404:
-                    _region_print(f"  Instance not found (skip): {instance_id}")
-                    continue
-                _region_print(
-                    f"  get_instance failed for {instance_id}: {e.status} {e.message}"
+        with ThreadPoolExecutor(max_workers=min(len(instances), MAX_INSTANCE_WORKERS)) as executor:
+            results = [
+                r
+                for r in executor.map(
+                    lambda inst: _relationship_for_instance(inst, region_config, signer, clients),
+                    instances,
                 )
-                if not compartment_id:
-                    continue
-
-            if not resource_name:
-                resource_name = instance_id
-            if not compartment_id:
-                _region_print(f"  No compartment for {instance_id}; skip attachments")
-                related: list[dict] = []
-            else:
-                related = related_resources_for_instance(
-                    compute_client,
-                    block_client,
-                    instance_id,
-                    compartment_id,
-                    availability_domain,
-                )
-
-            results.append(
-                {
-                    "master": {
-                        "resourceName": resource_name,
-                        "resourceType": INSTANCE_RESOURCE_TYPE,
-                        "resourceId": instance_id,
-                    },
-                    "related": related,
-                }
-            )
-            backup_n = sum(
-                1
-                for r in related
-                if r.get("resourceType")
-                in (BOOT_VOLUME_BACKUP_RESOURCE_TYPE, BLOCK_VOLUME_BACKUP_RESOURCE_TYPE)
-            )
-            _region_print(
-                f"  {resource_name}: {len(related)} related "
-                f"({backup_n} backup(s))"
-            )
+                if r is not None
+            ]
     except oci.exceptions.ServiceError as e:
         if e.status == 401:
             _region_print(

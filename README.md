@@ -49,8 +49,9 @@ allow group <your-group> to read vmware-family in tenancy
 allow group <your-group> to read all-resources in tenancy
 ```
 
-`read all-resources` is used by `getResourceNames.py` (Resource Search) to look up names
-of resources. Tagging unattached volumes (`SetDeletionForUnattachedDisk`) also needs
+`read all-resources` is used for Resource Search: `getResourceNames.py` looks up resource
+names with it, and `getStorageReport.py` uses it to skip compartments without instances or
+volumes. Tagging unattached volumes (`SetDeletionForUnattachedDisk`) also needs
 `use volume-family` and `use tag-namespaces` for the tag namespace in `config.json`.
 Uploading the reports needs `manage objects` on the upload bucket.
 

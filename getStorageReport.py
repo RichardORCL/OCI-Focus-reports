@@ -44,6 +44,7 @@ STORAGE_JSON_NAME = "unattached_volumes.json"
 SCHEMA_VERSION = 1
 # Cap concurrent region queries to reduce DNS/socket pressure (Windows getaddrinfo failures under load).
 MAX_REGION_WORKERS = 15
+MAX_COMPARTMENT_WORKERS = 8   # compartments scanned at the same time per region (API limits are per region)
 
 _region_print_lock = threading.Lock()
 
@@ -224,8 +225,6 @@ def gather_unattached_rows_for_region(
     """List unattached block/boot volumes for one region (for parallel execution per region)."""
     region_config = dict(base_config)
     region_config["region"] = region
-    block_client = oci.core.BlockstorageClient(region_config, signer=signer)
-    compute_client = oci.core.ComputeClient(region_config, signer=signer)
     identity_client = oci.identity.IdentityClient(region_config, signer=signer)
 
     _region_print(f"\n--- Region: {region} ---")
@@ -233,8 +232,8 @@ def gather_unattached_rows_for_region(
     try:
         return _gather_unattached_rows_for_region_body(
             region,
-            block_client,
-            compute_client,
+            region_config,
+            signer,
             identity_client,
             tenant_id,
             compartments,
@@ -262,10 +261,37 @@ def gather_unattached_rows_for_region(
         return []
 
 
+def compartments_with_storage(region_config: dict, signer, compartments) -> list:
+    """
+    Compartments that hold instances, block volumes or boot volumes in this region,
+    found with one Resource Search query, so empty compartments are not scanned.
+    Keeps the original compartment order. Returns all compartments if the search fails.
+    """
+    search_client = oci.resource_search.ResourceSearchClient(region_config, signer=signer)
+    details = oci.resource_search.models.StructuredSearchDetails(
+        query="query instance, volume, bootvolume resources"
+    )
+    used: set[str] = set()
+    page = None
+    try:
+        while True:
+            response = search_client.search_resources(
+                details, limit=1000, page=page, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY
+            )
+            used.update(item.compartment_id for item in response.data.items or [])
+            page = response.next_page
+            if not page:
+                break
+    except (oci.exceptions.ServiceError, oci.exceptions.RequestException) as e:
+        _region_print(f"  Resource Search failed ({getattr(e, 'status', e)}), scanning all compartments")
+        return list(compartments)
+    return [comp for comp in compartments if comp.details.id in used]
+
+
 def _gather_unattached_rows_for_region_body(
     region: str,
-    block_client,
-    compute_client,
+    region_config: dict,
+    signer,
     identity_client,
     tenant_id: str,
     compartments,
@@ -284,22 +310,49 @@ def _gather_unattached_rows_for_region_body(
             "  Warning: no availability domains; boot volumes in use by instances may be misclassified."
         )
 
-    attached_in_region = set()
-    for comp in compartments:
+    # Only compartments that contain instances or volumes need to be scanned.
+    all_compartments = compartments
+    compartments = compartments_with_storage(region_config, signer, all_compartments)
+    _region_print(f"  [{region}] {len(compartments)} of {len(all_compartments)} compartment(s) "
+                  "contain instances or volumes")
+    if not compartments:
+        _region_print(f"  Unattached block + boot volumes in {region}: 0")
+        return []
+
+    # Compartments are scanned in parallel (MAX_COMPARTMENT_WORKERS per region). SDK clients
+    # are not shared between threads, so every worker thread gets its own clients.
+    thread_clients = threading.local()
+
+    def clients():
+        if not hasattr(thread_clients, "compute"):
+            thread_clients.compute = oci.core.ComputeClient(region_config, signer=signer)
+            thread_clients.block = oci.core.BlockstorageClient(region_config, signer=signer)
+        return thread_clients.compute, thread_clients.block
+
+    def attached_in_compartment(comp) -> set[str]:
+        compute_client, _ = clients()
         cid = comp.details.id
+        ids: set[str] = set()
         try:
-            attached_in_region.update(attached_volume_ocids(compute_client, cid))
+            ids.update(attached_volume_ocids(compute_client, cid))
         except oci.exceptions.ServiceError as e:
             if e.status == 401:
                 raise
             _region_print(
                 f"  Skip block volume attachment scan for compartment {cid}: {e.status} {e.message}"
             )
-        attached_in_region.update(attached_boot_volume_ocids(compute_client, cid, ad_names))
+        ids.update(attached_boot_volume_ocids(compute_client, cid, ad_names))
+        return ids
 
-    rows: list[dict] = []
-    region_count = 0
-    for comp in compartments:
+    attached_in_region = set()
+    with ThreadPoolExecutor(max_workers=MAX_COMPARTMENT_WORKERS) as executor:
+        for ids in executor.map(attached_in_compartment, compartments):
+            attached_in_region.update(ids)
+
+    def unattached_in_compartment(comp) -> tuple[list[dict], int]:
+        _, block_client = clients()
+        comp_rows: list[dict] = []
+        comp_count = 0
         cid = comp.details.id
         seen_ocids: set[str] = set()
         try:
@@ -315,9 +368,9 @@ def _gather_unattached_rows_for_region_body(
                     continue
                 seen_ocids.add(vol.id)
                 kind = "boot" if getattr(vol, "is_boot_volume", False) else "block"
-                rows.append(
+                comp_rows.append(
                     build_storage_row_dict(
-                        vol, region, cid, compartments, kind, created_by_key, created_date_key
+                        vol, region, cid, all_compartments, kind, created_by_key, created_date_key
                     )
                 )
                 if set_deletion_tags:
@@ -339,7 +392,7 @@ def _gather_unattached_rows_for_region_body(
                             f"  Could not set deletion tags on {kind} volume {vol.id}: "
                             f"{e.status} {e.message}"
                         )
-                region_count += 1
+                comp_count += 1
         except oci.exceptions.ServiceError as e:
             if e.status == 401:
                 raise
@@ -356,9 +409,9 @@ def _gather_unattached_rows_for_region_body(
                 if vol.id in attached_in_region or vol.id in seen_ocids:
                     continue
                 seen_ocids.add(vol.id)
-                rows.append(
+                comp_rows.append(
                     build_storage_row_dict(
-                        vol, region, cid, compartments, "boot", created_by_key, created_date_key
+                        vol, region, cid, all_compartments, "boot", created_by_key, created_date_key
                     )
                 )
                 if set_deletion_tags:
@@ -380,11 +433,20 @@ def _gather_unattached_rows_for_region_body(
                             f"  Could not set deletion tags on boot volume {vol.id}: "
                             f"{e.status} {e.message}"
                         )
-                region_count += 1
+                comp_count += 1
         except oci.exceptions.ServiceError as e:
             if e.status == 401:
                 raise
             _region_print(f"  Skip boot volume list for compartment {cid}: {e.status} {e.message}")
+        return comp_rows, comp_count
+
+    rows: list[dict] = []
+    region_count = 0
+    # executor.map keeps the compartment order, so the output is the same as a sequential scan
+    with ThreadPoolExecutor(max_workers=MAX_COMPARTMENT_WORKERS) as executor:
+        for comp_rows, comp_count in executor.map(unattached_in_compartment, compartments):
+            rows.extend(comp_rows)
+            region_count += comp_count
 
     _region_print(f"  Unattached block + boot volumes in {region}: {region_count}")
     return rows
