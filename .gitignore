@@ -1,0 +1,65 @@
+# ------------------------------------------------------------------
+# Report data and generated output: never commit real billing data
+# ------------------------------------------------------------------
+
+# Downloaded FOCUS reports, consolidated CSV/HTML, anon_mapping.json (getFocusReports / consolidateReports / make*Report)
+FocusReports/
+
+# Consolidated output, storage report JSON (consolidateReports.py, getStorageReport.py)
+consolidateReports/
+
+# Resource names and relationship JSON (getResourceNames.py, getRelationships.py)
+relationships/
+
+# Any stray report output written outside the folders above
+*.csv
+!resourceTypeOciConsole.csv
+*.csv.gz
+*.html
+*.xlsx
+*.xls
+*.json
+!config.example.json
+
+# Archives (report zips can be very large; GitHub rejects files over 100 MB)
+*.zip
+*.gz
+*.7z
+*.tar
+
+# Logs (-log option)
+*.log
+log.txt
+
+# Local run script (copy runall.example.bat to runall.bat)
+runall.bat
+
+# Local settings (copy config.example.json to config.json)
+config.json
+config copy.json
+
+# ------------------------------------------------------------------
+# Credentials: never commit OCI keys or config
+# ------------------------------------------------------------------
+.oci/
+*.pem
+*.key
+oci_config
+.env
+
+# ------------------------------------------------------------------
+# Python / editor
+# ------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.vscode/
+.idea/
+
+# Internal design notes / AI prompts (not part of the published project)
+docs/superpowers/
+rebuild_prompt.md
+CLAUDE.md
+.claude/

@@ -1,0 +1,29 @@
+{
+  "focusReports": {
+    "namespace": "<cost-report-namespace>",
+    "bucket": "internal-{tenancy}",
+    "legacyNamespace": "bling",
+    "legacyBucket": "{tenancy}",
+    "updateLookbackDays": 3
+  },
+  "upload": {
+    "namespace": "",
+    "bucket": "",
+    "sourceDir": "FocusReports/ConsolidatedHTML"
+  },
+  "dailyReportStaleCheckDays": 5,
+  "tags": {
+    "createdBy": "Oracle-Tags.CreatedBy",
+    "createdDate": "Oracle-Tags.CreatedOn"
+  },
+  "usdConversionRate": 1,
+  "DayMargin": 1,
+  "SetDeletionForUnattachedDisk": false,
+  "unattachedVolumeDeletionTags": {
+    "namespace": "Optimization",
+    "scheduleForDeletionKey": "ScheduleForDeletion",
+    "nextDeletionScheduleKey": "NextDeletionSchedule",
+    "deletionScheduleDaysAhead": 14,
+    "scheduleForDeletionValue": "True"
+  }
+}

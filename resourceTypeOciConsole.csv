@@ -1,0 +1,38 @@
+service_name, resource_type,url_prefix
+access_gov, agcsgovernanceinstance, idm-agcs/service-instance/
+api_gateway, apigateway, api-gateway/gateways/
+compute, instance,compute/instances/
+compute, capacityreservation, compute/capacity-reservations/
+compute, image, compute/images/
+container_instance, computecontainerinstance, /container-instances/
+oke_control_plane, cluster, containers/clusters/
+block_storage, bootvolume, block-storage/boot-volumes/
+block_storage, volume, block-storage/volumes/
+block_storage, bootvolumereplica, block-storage/boot-volume-replicas/
+block_storage, volumereplica, block-storage/volume-replicas/
+block_storage, blockvolumereplica, block-storage/block-volume-replicas/
+block_storage, volumebackup, block-storage/volume-backups/
+block_storage, bootvolumebackup, block-storage/boot-volume-backups/
+objectstore, storage, object-storage/buckets/
+database, dbsystem, dbaas/dbsystems/
+database, autonomousdatabase, db/adbd/
+data_science, datasciencenotebooksession, /data-science/notebook-sessions
+oracle_digital_assistant, odainstance, digital-assistant/oda-instances/
+analytics_cloud, analyticsinstance, analytics/instances/
+secure_desktops, desktoppool, compute/desktops/pools/
+fullstack_disaster_recovery, drprotectiongroup, disaster-recovery/protection-groups/
+logging_analytics, tenancy, loganalytics/home?id=OOBD-log-analytics-HOMEPAGE&comp=
+logging, log, /logging/logs/
+oralb, loadbalancer, load-balancer/load-balancers/ 
+network_firewall, networkfirewall, networking/network-firewall/firewalls/
+kms,vault, security/kms/
+integration_cloud, integrationinstance, oic/integration-instances/
+odsp, postgresqldbsystem, postgresql/db-systems/
+vpn, virtualcircuit, networking/fast-connect/virtual-circuit/
+redis, rediscluster, ocicache/clusters/
+opensearch, opensearchcluster, opensearch/clusters/
+mysql, mysqlinstance, mysqlaas/db-systems/
+oracle_health_checks, httpmonitor, healthchecks/
+oracle_health_checks, pingmonitor, healthchecks/
+integration_cloud, integrationinstance, oic/integration-instances/
+waf, webappfirewall, waf/policies/
